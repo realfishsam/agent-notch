@@ -149,7 +149,7 @@ final class ProcessDiscovery {
     private func isOpenCode(_ command: String) -> Bool {
         let lowered = command.lowercased()
         guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
-        return first == "opencode" || first.hasSuffix("/opencode") || lowered.contains("/opencode")
+        return first == "opencode" || first.hasSuffix("/opencode")
     }
 
     private func isHermes(_ command: String) -> Bool {
@@ -368,7 +368,7 @@ final class SessionScanner {
         // Last assistant text as snippet
         let snippetSQL = """
         SELECT p.data FROM part p JOIN message m ON p.message_id = m.id
-        WHERE p.session_id = '\\(sessionID)' AND json_extract(m.data, '$.role') = 'assistant'
+        WHERE p.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') = 'assistant'
         AND json_extract(p.data, '$.type') = 'text'
         ORDER BY p.time_created DESC LIMIT 1;
         """
@@ -385,7 +385,7 @@ final class SessionScanner {
         // Last user text as prompt
         let promptSQL = """
         SELECT p.data FROM part p JOIN message m ON p.message_id = m.id
-        WHERE p.session_id = '\\(sessionID)' AND json_extract(m.data, '$.role') = 'user'
+        WHERE p.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') = 'user'
         AND json_extract(p.data, '$.type') = 'text'
         ORDER BY p.time_created DESC LIMIT 1;
         """
@@ -402,7 +402,7 @@ final class SessionScanner {
         // Activity: last user or assistant message time
         let activitySQL = """
         SELECT json_extract(m.data, '$.time.created') FROM message m
-        WHERE m.session_id = '\\(sessionID)' AND json_extract(m.data, '$.role') IN ('user', 'assistant')
+        WHERE m.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') IN ('user', 'assistant')
         ORDER BY m.time_created DESC LIMIT 1;
         """
         var activity: Date?
