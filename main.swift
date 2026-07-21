@@ -422,10 +422,12 @@ final class SessionScanner {
         guard fm.fileExists(atPath: dbPath) else { return [] }
         // Active sessions: ended_at IS NULL, started in last 6h
         let sql = #"""
-        SELECT id, title, model, started_at
-        FROM sessions
-        WHERE ended_at IS NULL AND started_at > \#(Date().timeIntervalSince1970 - 6 * 3600)
-        ORDER BY started_at DESC
+        SELECT s.id, s.title, s.model, s.started_at, MAX(m.timestamp) AS last_activity
+        FROM sessions s
+        LEFT JOIN messages m ON m.session_id = s.id
+        WHERE s.ended_at IS NULL AND s.started_at > \#(Date().timeIntervalSince1970 - 6 * 3600)
+        GROUP BY s.id
+        ORDER BY COALESCE(last_activity, s.started_at) DESC
         LIMIT 10;
         """#
         guard let rows = run("/usr/bin/sqlite3", [dbPath, sql], timeout: 1.0) else { return [] }
@@ -441,6 +443,9 @@ final class SessionScanner {
             var sess = AgentSession(id: id, kind: .hermes, title: title,
                                     snippet: "", model: model, lastModified: mtime)
             sess.prompt = title
+            if cols.count >= 5, let activity = Double(cols[4]) {
+                sess.lastActivity = Date(timeIntervalSince1970: activity)
+            }
             sess.isLive = true
             out.append(sess)
         }
@@ -625,6 +630,16 @@ final class DitherIconView: NSView {
             return
         }
         let alpha: CGFloat = idle ? 0.4 : 1.0
+        if kind == .hermes, let icon = IndicatorView.hermesIcon {
+            let base: CGFloat = 16
+            let pulse: CGFloat = running ? sin(t * 8) * 1.0 : 0
+            let side = base + pulse
+            let x = 1 + (base - side) / 2
+            let y = running ? sin(t * 8) * 1.5 : 0
+            NSGraphicsContext.current?.imageInterpolation = .high
+            icon.draw(in: NSRect(x: x, y: y, width: side, height: side), from: .zero, operation: .sourceOver, fraction: alpha)
+            return
+        }
         if kind == .codex, let sprite = IndicatorView.codexSprite {
             let fw: CGFloat = 192, fh: CGFloat = 208
             let idx = idle ? 0 : Int(t / 0.12) % 8
@@ -893,18 +908,18 @@ final class IndicatorView: NSView {
         case .inactive: break
         }
         switch codexState {
-        case .running: _ = drawCodexPet(ctx, right: x, cy: cy)
-        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .running: x = drawCodexPet(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
         switch opencodeState {
-        case .running: _ = drawRing(ctx, right: x, cy: cy, color: Self.opencodePurple)
-        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .running: x = drawRing(ctx, right: x, cy: cy, color: Self.opencodePurple) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
         switch hermesState {
-        case .running: _ = drawRing(ctx, right: x, cy: cy, color: Self.hermesAmber)
-        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .running: x = drawHermesIcon(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
     }
@@ -926,6 +941,30 @@ final class IndicatorView: NSView {
                                 width: cell - 0.5, height: cell - 0.5))
             }
         }
+    }
+
+    private static let hermesAppPaths = [
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".hermes/hermes-agent/apps/desktop/release/mac-arm64/Hermes.app").path,
+        "/Applications/Hermes.app"
+    ]
+    static var hermesIcon: NSImage? = {
+        guard let path = hermesAppPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else { return nil }
+        return NSWorkspace.shared.icon(forFile: path)
+    }()
+
+    private func drawHermesIcon(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+        guard let icon = Self.hermesIcon else {
+            return drawRing(ctx, right: right, cy: cy, color: Self.hermesAmber)
+        }
+        let base: CGFloat = 22
+        let pulse: CGFloat = sin(t * 8) * 1.5
+        let side = base + pulse
+        let bob: CGFloat = sin(t * 8) * 2
+        let dest = NSRect(x: right - side, y: cy - side / 2 + bob, width: side, height: side)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        icon.draw(in: dest, from: .zero, operation: .sourceOver, fraction: 1)
+        return dest.minX
     }
 
     /// Returns the left edge of what was drawn.
@@ -1354,7 +1393,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let opencodeLive = result.contains { $0.kind == .opencode && $0.anyLive }
                 let opencodeBusy = result.contains { $0.kind == .opencode && $0.anyBusy }
                 let hermesLive = result.contains { $0.kind == .hermes && $0.anyLive }
-                let hermesBusy = result.contains { $0.kind == .hermes && $0.anyBusy }
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
                     : (self.claudeWasLive ? .done : self.claudeState)
@@ -1364,8 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.opencodeState = opencodeBusy ? .running
                     : opencodeLive ? .inactive
                     : (self.opencodeWasLive ? .done : self.opencodeState)
-                self.hermesState = hermesBusy ? .running
-                    : hermesLive ? .inactive
+                self.hermesState = hermesLive ? .running
                     : (self.hermesWasLive ? .done : self.hermesState)
                 self.claudeWasLive = claudeLive
                 self.codexWasLive = codexLive
