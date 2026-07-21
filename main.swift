@@ -3,7 +3,7 @@ import ApplicationServices
 
 // MARK: - Model
 
-enum AgentKind: String { case claude = "Claude Code", codex = "Codex", opencode = "OpenCode" }
+enum AgentKind: String { case claude = "Claude Code", codex = "Codex", opencode = "OpenCode", hermes = "Hermes" }
 
 struct AgentSession {
     let id: String
@@ -61,13 +61,20 @@ final class ProcessDiscovery {
             if isClaude(command) { kind = .claude }
             else if isCodex(command) { kind = .codex }
             else if isOpenCode(command) { kind = .opencode }
+            else if isHermes(command) { kind = .hermes }
             else { continue }
-            // Claude requires terminal; Codex/OpenCode can be desktop apps without TTY
+            // Claude requires terminal; Codex/OpenCode/Hermes can be desktop apps without TTY
             if kind == .claude, !hasTTY { continue }
             // Codex desktop (no TTY): sentinel without lsof — desktop app has too many
             // open files for lsof to be reliable at 0.2 s timeout
             if kind == .codex, !hasTTY {
                 guard claimed.insert("codex-desktop").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                continue
+            }
+            // Hermes: always sentinel (all processes are background, no TTY)
+            if kind == .hermes {
+                guard claimed.insert("hermes").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
                 continue
             }
@@ -97,6 +104,8 @@ final class ProcessDiscovery {
                 guard cwd != nil else { continue }
                 guard claimed.insert("opencode:\(tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: cwd))
+            case .hermes:
+                break // unreachable: hermes handled before lsof guard
             }
         }
         return out
@@ -119,6 +128,13 @@ final class ProcessDiscovery {
         let lowered = command.lowercased()
         guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
         return first == "opencode" || first.hasSuffix("/opencode") || lowered.contains("/opencode")
+    }
+
+    private func isHermes(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        return lowered.contains("hermes_cli") || lowered.contains("slash_worker")
+            || lowered.contains("/hermes.app/contents/macos/hermes")
+            || lowered.contains("hermes-agent")
     }
 
     private func workingDirectory(from lsof: String) -> String? {
@@ -192,9 +208,11 @@ final class SessionScanner {
     /// Together they are the sole source of truth for isRunning.
     func scan(live: Set<String>, claudeCwdCounts: [String: Int], opencodeCwds: Set<String>) -> [AgentSession] {
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
+        let hermesLive = live.contains("hermes")
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
             + groupCodex(scanCodex(live: live).filter(recent))
             + scanOpenCode(liveCwds: opencodeCwds).filter(recent)
+            + scanHermes(isLive: hermesLive).filter(recent)
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -372,6 +390,39 @@ final class SessionScanner {
             activity = Date(timeIntervalSince1970: ts / 1000)
         }
         return (snippet, prompt, activity)
+    }
+
+    /// Hermes Agent stores sessions in SQLite at ~/.hermes/state.db.
+    /// Liveness: sentinel-based — if any hermes process is alive, active sessions are live.
+    private func scanHermes(isLive: Bool) -> [AgentSession] {
+        guard isLive else { return [] }
+        let dbPath = home.appendingPathComponent(".hermes/state.db").path
+        guard fm.fileExists(atPath: dbPath) else { return [] }
+        // Active sessions: ended_at IS NULL, started in last 6h
+        let sql = #"""
+        SELECT id, title, model, started_at
+        FROM sessions
+        WHERE ended_at IS NULL AND started_at > \#(Date().timeIntervalSince1970 - 6 * 3600)
+        ORDER BY started_at DESC
+        LIMIT 10;
+        """#
+        guard let rows = run("/usr/bin/sqlite3", [dbPath, sql], timeout: 1.0) else { return [] }
+        var out: [AgentSession] = []
+        for line in rows.split(separator: "\n") {
+            let cols = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard cols.count >= 4 else { continue }
+            let id = String(cols[0]), title = String(cols[1])
+            let model = String(cols[2]), started = String(cols[3])
+            guard let ts = Double(started) else { continue }
+            let mtime = Date(timeIntervalSince1970: ts)
+            // ponytail: no snippet extraction from messages table; use session title
+            var sess = AgentSession(id: id, kind: .hermes, title: title,
+                                    snippet: "", model: model, lastModified: mtime)
+            sess.prompt = title
+            sess.isLive = true
+            out.append(sess)
+        }
+        return out
     }
 
     /// Claude Code subagent transcripts live in <proj>/<session-uuid>/subagents/agent-*.jsonl
@@ -774,11 +825,13 @@ final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var opencodeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
+    var hermesState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var t: CGFloat = 0 { didSet { needsDisplay = true } }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
     static let codexTeal = NSColor(red: 0.06, green: 0.64, blue: 0.50, alpha: 1)     // OpenAI teal
     static let opencodePurple = NSColor(red: 0.55, green: 0.30, blue: 0.85, alpha: 1) // OpenCode purple
+    static let hermesAmber = NSColor(red: 0.95, green: 0.65, blue: 0.15, alpha: 1)    // Hermes amber/gold
 
     // The Claude Code launch-banner mascot, drawn from its real block characters.
     // Two frames: the feet alternate so it walks.
@@ -824,6 +877,11 @@ final class IndicatorView: NSView {
         }
         switch opencodeState {
         case .running: _ = drawRing(ctx, right: x, cy: cy, color: Self.opencodePurple)
+        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .inactive: break
+        }
+        switch hermesState {
+        case .running: _ = drawRing(ctx, right: x, cy: cy, color: Self.hermesAmber)
         case .done: drawGreenBlob(ctx, right: x, cy: cy)
         case .inactive: break
         }
@@ -997,9 +1055,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var claudeWasLive = false
     private var codexWasLive = false
     private var opencodeWasLive = false
+    private var hermesWasLive = false
     private var claudeState: AgentGlyphState = .inactive
     private var codexState: AgentGlyphState = .inactive
     private var opencodeState: AgentGlyphState = .inactive
+    private var hermesState: AgentGlyphState = .inactive
     private var expanded = false
 
     // Geometry
@@ -1112,6 +1172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.claudeState == .done { self.claudeState = .inactive }
                 if self.codexState == .done { self.codexState = .inactive }
                 if self.opencodeState == .done { self.opencodeState = .inactive }
+                if self.hermesState == .done { self.hermesState = .inactive }
                 self.render()
             }
         }
@@ -1228,6 +1289,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else if snap.kind == .codex {
                     // Desktop sentinel: process alive but no open transcript
                     seen.insert("codex-desktop")
+                } else if snap.kind == .hermes {
+                    seen.insert("hermes")
                 }
             }
             for p in seen { self.missCounts[p] = 0 }
@@ -1268,6 +1331,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
                 let opencodeLive = result.contains { $0.kind == .opencode && $0.anyLive }
                 let opencodeBusy = result.contains { $0.kind == .opencode && $0.anyBusy }
+                let hermesLive = result.contains { $0.kind == .hermes && $0.anyLive }
+                let hermesBusy = result.contains { $0.kind == .hermes && $0.anyBusy }
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
                     : (self.claudeWasLive ? .done : self.claudeState)
@@ -1277,9 +1342,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.opencodeState = opencodeBusy ? .running
                     : opencodeLive ? .inactive
                     : (self.opencodeWasLive ? .done : self.opencodeState)
+                self.hermesState = hermesBusy ? .running
+                    : hermesLive ? .inactive
+                    : (self.hermesWasLive ? .done : self.hermesState)
                 self.claudeWasLive = claudeLive
                 self.codexWasLive = codexLive
                 self.opencodeWasLive = opencodeLive
+                self.hermesWasLive = hermesLive
                 self.render()
             }
         }
@@ -1294,6 +1363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
         indicatorView.opencodeState = opencodeState
+        indicatorView.hermesState = hermesState
         indicatorView.t = CGFloat(frame) * 0.12
     }
 }
@@ -1311,6 +1381,7 @@ if CommandLine.arguments.contains("--scan") {
         else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
         else if s.kind == .opencode, let c = s.cwd { opencodeCwds.insert(c) }
         else if s.kind == .codex { live.insert("codex-desktop") }
+        else if s.kind == .hermes { live.insert("hermes") }
     }
     print("== sessions ==")
     for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts, opencodeCwds: opencodeCwds) {
