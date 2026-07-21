@@ -3,7 +3,7 @@ import ApplicationServices
 
 // MARK: - Model
 
-enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
+enum AgentKind: String { case claude = "Claude Code", codex = "Codex", opencode = "OpenCode", hermes = "Hermes" }
 
 struct AgentSession {
     let id: String
@@ -18,11 +18,16 @@ struct AgentSession {
     var nickname: String?
     var children: [AgentSession] = []
     var isLive: Bool = false  // process alive (from discovery, never mtime)
+    var busyOverride: Bool?
     // last user/assistant entry — housekeeping writes (away_summary etc.)
     // bump the file mtime but must not count as activity
     var lastActivity: Date?
     // hybrid: busy = alive AND conversing; quiet-while-alive is idle, not done
-    var isBusy: Bool { isLive && Date().timeIntervalSince(lastActivity ?? lastModified) < 30 }
+    var isBusy: Bool {
+        guard isLive else { return false }
+        if let busyOverride { return busyOverride }
+        return Date().timeIntervalSince(lastActivity ?? lastModified) < 30
+    }
     var anyLive: Bool { isLive || children.contains { $0.isLive } }
     var anyBusy: Bool { isBusy || children.contains { $0.isBusy } }
     var effectiveLastModified: Date { children.reduce(lastModified) { max($0, $1.lastModified) } }
@@ -42,45 +47,72 @@ final class ProcessDiscovery {
     // rollout file open, so the path route always works there.
     struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
 
-    // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
-    // heavy load (a codex swarm compiling) blows through 0.2s and every agent
-    // reads as dead — so: generous budgets, and ONE batched lsof per poll.
     private static let psTimeout: TimeInterval = 2.0
     private static let lsofTimeout: TimeInterval = 2.0
 
     func liveTranscripts() -> [Snapshot] {
         guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,command="], timeout: Self.psTimeout) else { return [] }
         var candidates: [(pid: String, tty: String, kind: AgentKind)] = []
+        var out: [Snapshot] = []
+        var claimed = Set<String>()
         for line in psOut.split(whereSeparator: \.isNewline) {
             let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 .split(maxSplits: 3, whereSeparator: \.isWhitespace)
             guard parts.count == 4 else { continue }
             let pid = String(parts[0]), tty = String(parts[2])
             let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
-            if isClaude(command) { candidates.append((pid, tty, .claude)) }
-            else if isCodex(command) { candidates.append((pid, tty, .codex)) }
+            guard !command.isEmpty else { continue }
+            let hasTTY = tty != "??"
+            let kind: AgentKind
+            if isClaude(command) { kind = .claude }
+            else if isCodex(command) { kind = .codex }
+            else if isOpenCode(command) { kind = .opencode }
+            else if isHermes(command) { kind = .hermes }
+            else { continue }
+            // Claude requires terminal; Codex/OpenCode/Hermes can be desktop apps without TTY
+            if kind == .claude, !hasTTY { continue }
+            // Codex desktop (no TTY): sentinel without lsof
+            if kind == .codex, !hasTTY {
+                guard claimed.insert("codex-desktop").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                continue
+            }
+            // Hermes: always sentinel (all processes are background, no TTY)
+            if kind == .hermes {
+                guard claimed.insert("hermes").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                continue
+            }
+            candidates.append((pid, tty, kind))
         }
+        // Batch lsof for all remaining candidates
         let chunks = lsofChunks(pids: candidates.map(\.pid))
-        var out: [Snapshot] = []
-        var claimed = Set<String>()
         for (pid, tty, kind) in candidates {
             guard let lsof = chunks[pid] else { continue }
             let cwd = workingDirectory(from: lsof)
-            // Claude subagents run in .claude/worktrees/agent-*/ — they are
-            // metadata on the parent session, not sessions of their own.
+            // Claude subagents run in .claude/worktrees/agent-*/
             if kind == .claude, let cwd, cwd.contains("/.claude/worktrees/agent-") { continue }
             switch kind {
             case .claude:
                 let path = bestClaudeTranscript(in: lsof, cwd: cwd)
                 guard path != nil || cwd != nil else { continue }
-                // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             case .codex:
-                guard let path = bestCodexTranscript(in: lsof),
-                      claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                if let path = bestCodexTranscript(in: lsof) {
+                    guard claimed.insert("codex:\(path)").inserted else { continue }
+                    out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                } else {
+                    // Desktop app (no open JSONL): sentinel for global Codex liveness
+                    guard claimed.insert("codex-desktop").inserted else { continue }
+                    out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
+                }
+            case .opencode:
+                guard cwd != nil else { continue }
+                guard claimed.insert("opencode:\(tty)").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: cwd))
+            case .hermes:
+                break // unreachable: hermes handled before lsof
             }
         }
         return out
@@ -117,6 +149,19 @@ final class ProcessDiscovery {
         let lowered = command.lowercased()
         guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
         return first == "codex" || first.hasSuffix("/codex") || lowered.contains("/codex/codex")
+    }
+
+    private func isOpenCode(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
+        return first == "opencode" || first.hasSuffix("/opencode")
+    }
+
+    private func isHermes(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        return lowered.contains("hermes_cli") || lowered.contains("slash_worker")
+            || lowered.contains("/hermes.app/contents/macos/hermes")
+            || lowered.contains("hermes-agent")
     }
 
     private func workingDirectory(from lsof: String) -> String? {
@@ -188,10 +233,13 @@ final class SessionScanner {
     /// `claudeCwdCounts` = encoded-project-dir → number of claude processes
     /// with that cwd (the fallback when claude exposes no open transcript).
     /// Together they are the sole source of truth for isRunning.
-    func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
+    func scan(live: Set<String>, claudeCwdCounts: [String: Int], opencodeCwds: Set<String>) -> [AgentSession] {
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
+        let hermesLive = live.contains("hermes")
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
             + groupCodex(scanCodex(live: live).filter(recent))
+            + scanOpenCode(liveCwds: opencodeCwds).filter(recent)
+            + scanHermes(isLive: hermesLive).filter(recent)
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -261,6 +309,7 @@ final class SessionScanner {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".codex/sessions")
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
+        let codexDesktopLive = live.contains("codex-desktop")
         for case let f as URL in en where f.pathExtension == "jsonl" {
             guard let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
             // Skip old files early to avoid reading them
@@ -270,10 +319,140 @@ final class SessionScanner {
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
-            sess.isLive = live.contains(f.path)
+            sess.busyOverride = info.taskActive ?? false
+            // ponytail: desktop sentinel marks all Codex sessions live; single-session assumption
+            sess.isLive = live.contains(f.path) || codexDesktopLive
             sess.threadID = meta.id
             sess.parentID = meta.parentID
             sess.nickname = meta.nickname
+            out.append(sess)
+        }
+        return out
+    }
+
+    /// OpenCode stores sessions in SQLite at ~/.local/share/opencode/opencode.db.
+    /// Liveness: cwd-based — sessions whose directory matches a live process cwd.
+    private func scanOpenCode(liveCwds: Set<String>) -> [AgentSession] {
+        let dbPath = home.appendingPathComponent(".local/share/opencode/opencode.db").path
+        guard fm.fileExists(atPath: dbPath) else { return [] }
+        // ponytail: shell out to sqlite3 — no SQLite C library dependency
+        let sql = #"""
+        SELECT s.id, s.title, s.model, s.time_updated, s.directory
+        FROM session s
+        WHERE s.time_updated > \#(Int64((Date().timeIntervalSince1970 - 6 * 3600) * 1000))
+        ORDER BY s.time_updated DESC
+        LIMIT 20;
+        """#
+        guard let rows = run("/usr/bin/sqlite3", [dbPath, sql], timeout: 1.0) else { return [] }
+        var out: [AgentSession] = []
+        for line in rows.split(separator: "\n") {
+            let cols = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard cols.count >= 5 else { continue }
+            let id = String(cols[0]), title = String(cols[1])
+            let modelJSON = String(cols[2]), timeUpdated = String(cols[3])
+            let dir = String(cols[4])
+            guard let ts = Double(timeUpdated) else { continue }
+            let mtime = Date(timeIntervalSince1970: ts / 1000)
+            // Extract model name from JSON: {"id":"provider/model",...}
+            let model = modelJSON.range(of: #""id":"([^"]+)""#, options: .regularExpression)
+                .map { String(modelJSON[$0].dropFirst(6).dropLast(1)) }
+                ?? "opencode"
+            // Get snippet and prompt from the most recent part entry
+            let info = opencodeTailInfo(sessionID: id)
+            var sess = AgentSession(id: id, kind: .opencode, title: title,
+                                    snippet: info.snippet, model: model, lastModified: mtime)
+            sess.prompt = info.prompt
+            sess.lastActivity = info.activity
+            sess.isLive = liveCwds.contains(dir)
+            out.append(sess)
+        }
+        return out
+    }
+
+    private func opencodeTailInfo(sessionID: String) -> (snippet: String, prompt: String, activity: Date?) {
+        let dbPath = home.appendingPathComponent(".local/share/opencode/opencode.db").path
+        // Last assistant text as snippet
+        let snippetSQL = """
+        SELECT p.data FROM part p JOIN message m ON p.message_id = m.id
+        WHERE p.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') = 'assistant'
+        AND json_extract(p.data, '$.type') = 'text'
+        ORDER BY p.time_created DESC LIMIT 1;
+        """
+        var snippet = ""
+        if let raw = run("/usr/bin/sqlite3", [dbPath, snippetSQL], timeout: 0.5)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            if let r = raw.range(of: #""text":"([^"]*)""#, options: .regularExpression) {
+                var t = String(raw[r].dropFirst(8).dropLast(1))
+                t = t.replacingOccurrences(of: "\\n", with: " ")
+                if t.count > 90 { t = String(t.prefix(90)) + "…" }
+                snippet = t
+            }
+        }
+        // Last user text as prompt
+        let promptSQL = """
+        SELECT p.data FROM part p JOIN message m ON p.message_id = m.id
+        WHERE p.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') = 'user'
+        AND json_extract(p.data, '$.type') = 'text'
+        ORDER BY p.time_created DESC LIMIT 1;
+        """
+        var prompt = ""
+        if let raw = run("/usr/bin/sqlite3", [dbPath, promptSQL], timeout: 0.5)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            if let r = raw.range(of: #""text":"([^"]*)""#, options: .regularExpression) {
+                var t = String(raw[r].dropFirst(8).dropLast(1))
+                t = t.replacingOccurrences(of: "\\n", with: " ")
+                if t.count > 90 { t = String(t.prefix(90)) + "…" }
+                prompt = t
+            }
+        }
+        // Activity: last user or assistant message time
+        let activitySQL = """
+        SELECT json_extract(m.data, '$.time.created') FROM message m
+        WHERE m.session_id = '\(sessionID)' AND json_extract(m.data, '$.role') IN ('user', 'assistant')
+        ORDER BY m.time_created DESC LIMIT 1;
+        """
+        var activity: Date?
+        if let raw = run("/usr/bin/sqlite3", [dbPath, activitySQL], timeout: 0.5)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           let ts = Double(raw) {
+            activity = Date(timeIntervalSince1970: ts / 1000)
+        }
+        return (snippet, prompt, activity)
+    }
+
+    /// Hermes Agent stores sessions in SQLite at ~/.hermes/state.db.
+    /// Liveness: sentinel-based — if any hermes process is alive, active sessions are live.
+    private func scanHermes(isLive: Bool) -> [AgentSession] {
+        guard isLive else { return [] }
+        let dbPath = home.appendingPathComponent(".hermes/state.db").path
+        guard fm.fileExists(atPath: dbPath) else { return [] }
+        // Active sessions: ended_at IS NULL, started in last 6h
+        let sql = #"""
+        SELECT s.id, s.title, s.model, s.started_at, MAX(m.timestamp) AS last_activity
+        FROM sessions s
+        LEFT JOIN messages m ON m.session_id = s.id
+        WHERE s.ended_at IS NULL AND s.started_at > \#(Date().timeIntervalSince1970 - 6 * 3600)
+        GROUP BY s.id
+        ORDER BY COALESCE(last_activity, s.started_at) DESC
+        LIMIT 10;
+        """#
+        guard let rows = run("/usr/bin/sqlite3", [dbPath, sql], timeout: 1.0) else { return [] }
+        var out: [AgentSession] = []
+        for line in rows.split(separator: "\n") {
+            let cols = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard cols.count >= 4 else { continue }
+            let id = String(cols[0]), title = String(cols[1])
+            let model = String(cols[2]), started = String(cols[3])
+            guard let ts = Double(started) else { continue }
+            let mtime = Date(timeIntervalSince1970: ts)
+            // ponytail: no snippet extraction from messages table; use session title
+            var sess = AgentSession(id: id, kind: .hermes, title: title,
+                                    snippet: "", model: model, lastModified: mtime)
+            sess.prompt = title
+            if cols.count >= 5, let activity = Double(cols[4]) {
+                sess.lastActivity = Date(timeIntervalSince1970: activity)
+            }
+            sess.isLive = true
             out.append(sess)
         }
         return out
@@ -323,22 +502,23 @@ final class SessionScanner {
 
     /// Read the tail of a jsonl transcript: last human-readable text + model
     /// name + timestamp of the last conversational (user/assistant) entry.
-    private func tailInfo(of file: URL) -> (snippet: String, model: String, prompt: String, activity: Date?) {
-        guard let fh = try? FileHandle(forReadingFrom: file) else { return ("", "", "", nil) }
+    private func tailInfo(of file: URL) -> (snippet: String, model: String, prompt: String, activity: Date?, taskActive: Bool?) {
+        guard let fh = try? FileHandle(forReadingFrom: file) else { return ("", "", "", nil, nil) }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
         let readLen: UInt64 = min(size, 131_072)
         try? fh.seek(toOffset: size - readLen)
         guard let data = try? fh.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return ("", "", "", nil) }
+              let text = String(data: data, encoding: .utf8) else { return ("", "", "", nil, nil) }
         var snippet = "", model = "", prompt = ""
         var activity: Date?
+        var taskActive: Bool?
         for line in text.split(separator: "\n").reversed() {
             if model.isEmpty, let r = line.range(of: #""model":"([^"]+)""#, options: .regularExpression) {
                 model = String(line[r].dropFirst(9).dropLast(1))
                 model = model.replacingOccurrences(of: "claude-", with: "")
             }
-            if snippet.isEmpty || prompt.isEmpty || activity == nil,
+            if snippet.isEmpty || prompt.isEmpty || activity == nil || taskActive == nil,
                let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] {
                 if snippet.isEmpty, let s = extractText(obj) { snippet = s }
                 if prompt.isEmpty, let p = extractUserPrompt(obj) { prompt = p }
@@ -349,8 +529,14 @@ final class SessionScanner {
                    let ts = obj["timestamp"] as? String {
                     activity = Self.isoParser.date(from: ts)
                 }
+                if taskActive == nil,
+                   let payload = obj["payload"] as? [String: Any],
+                   let type = payload["type"] as? String {
+                    if type == "task_started" { taskActive = true }
+                    if type == "task_complete" { taskActive = false }
+                }
             }
-            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil { break }
+            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil && taskActive != nil { break }
         }
         if model.isEmpty, size > readLen {
             // model can appear only early in long transcripts — check the head too
@@ -362,7 +548,7 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        return (snippet, model, prompt, activity)
+        return (snippet, model, prompt, activity, taskActive)
     }
 
     /// The user's own message, if this line is one.
@@ -407,6 +593,26 @@ final class SessionScanner {
         if t.count > 90 { t = String(t.prefix(90)) + "…" }
         return t
     }
+
+    private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        var data = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            group.leave()
+        }
+        guard group.wait(timeout: .now() + timeout) == .success else { p.terminate(); return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }
 
 // MARK: - Dither theme views
@@ -437,6 +643,16 @@ final class DitherIconView: NSView {
             return
         }
         let alpha: CGFloat = idle ? 0.4 : 1.0
+        if kind == .hermes, let icon = IndicatorView.hermesIcon {
+            let base: CGFloat = 16
+            let pulse: CGFloat = running ? sin(t * 8) * 1.0 : 0
+            let side = base + pulse
+            let x = 1 + (base - side) / 2
+            let y = running ? sin(t * 8) * 1.5 : 0
+            NSGraphicsContext.current?.imageInterpolation = .high
+            icon.draw(in: NSRect(x: x, y: y, width: side, height: side), from: .zero, operation: .sourceOver, fraction: alpha)
+            return
+        }
         if kind == .codex, let sprite = IndicatorView.codexSprite {
             let fw: CGFloat = 192, fh: CGFloat = 208
             let idx = idle ? 0 : Int(t / 0.12) % 8
@@ -658,10 +874,14 @@ enum AgentGlyphState { case inactive, running, done }
 final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
+    var opencodeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
+    var hermesState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var t: CGFloat = 0 { didSet { needsDisplay = true } }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
     static let codexTeal = NSColor(red: 0.06, green: 0.64, blue: 0.50, alpha: 1)     // OpenAI teal
+    static let opencodePurple = NSColor(red: 0.55, green: 0.30, blue: 0.85, alpha: 1) // OpenCode purple
+    static let hermesAmber = NSColor(red: 0.95, green: 0.65, blue: 0.15, alpha: 1)    // Hermes amber/gold
 
     // The Claude Code launch-banner mascot, drawn from its real block characters.
     // Two frames: the feet alternate so it walks.
@@ -701,8 +921,18 @@ final class IndicatorView: NSView {
         case .inactive: break
         }
         switch codexState {
-        case .running: _ = drawCodexPet(ctx, right: x, cy: cy)
-        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .running: x = drawCodexPet(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
+        case .inactive: break
+        }
+        switch opencodeState {
+        case .running: x = drawRing(ctx, right: x, cy: cy, color: Self.opencodePurple) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
+        case .inactive: break
+        }
+        switch hermesState {
+        case .running: x = drawHermesIcon(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
     }
@@ -724,6 +954,30 @@ final class IndicatorView: NSView {
                                 width: cell - 0.5, height: cell - 0.5))
             }
         }
+    }
+
+    private static let hermesAppPaths = [
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".hermes/hermes-agent/apps/desktop/release/mac-arm64/Hermes.app").path,
+        "/Applications/Hermes.app"
+    ]
+    static var hermesIcon: NSImage? = {
+        guard let path = hermesAppPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else { return nil }
+        return NSWorkspace.shared.icon(forFile: path)
+    }()
+
+    private func drawHermesIcon(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+        guard let icon = Self.hermesIcon else {
+            return drawRing(ctx, right: right, cy: cy, color: Self.hermesAmber)
+        }
+        let base: CGFloat = 22
+        let pulse: CGFloat = sin(t * 8) * 1.5
+        let side = base + pulse
+        let bob: CGFloat = sin(t * 8) * 2
+        let dest = NSRect(x: right - side, y: cy - side / 2 + bob, width: side, height: side)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        icon.draw(in: dest, from: .zero, operation: .sourceOver, fraction: 1)
+        return dest.minX
     }
 
     /// Returns the left edge of what was drawn.
@@ -874,8 +1128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var frame = 0
     private var claudeWasLive = false
     private var codexWasLive = false
+    private var opencodeWasLive = false
+    private var hermesWasLive = false
     private var claudeState: AgentGlyphState = .inactive
     private var codexState: AgentGlyphState = .inactive
+    private var opencodeState: AgentGlyphState = .inactive
+    private var hermesState: AgentGlyphState = .inactive
     private var expanded = false
 
     // Geometry
@@ -987,6 +1245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if terminals.contains(app.bundleIdentifier ?? "") {
                 if self.claudeState == .done { self.claudeState = .inactive }
                 if self.codexState == .done { self.codexState = .inactive }
+                if self.opencodeState == .done { self.opencodeState = .inactive }
+                if self.hermesState == .done { self.hermesState = .inactive }
                 self.render()
             }
         }
@@ -1098,6 +1358,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let i = cwdIndex[encoded, default: 0]
                     cwdIndex[encoded] = i + 1
                     seen.insert("cwd#\(encoded)#\(i)")
+                } else if snap.kind == .opencode, let cwd = snap.cwd {
+                    seen.insert("opencode:\(cwd)")
+                } else if snap.kind == .codex {
+                    // Desktop sentinel: process alive but no open transcript
+                    seen.insert("codex-desktop")
+                } else if snap.kind == .hermes {
+                    seen.insert("hermes")
                 }
             }
             for p in seen { self.missCounts[p] = 0 }
@@ -1106,15 +1373,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             var live = Set<String>()
             var cwdCounts: [String: Int] = [:]
+            var opencodeCwdsFinal = Set<String>()
             for key in self.missCounts.keys {
                 if key.hasPrefix("cwd#") {
                     let encoded = String(key.dropFirst(4).split(separator: "#")[0])
                     cwdCounts[encoded, default: 0] += 1
+                } else if key.hasPrefix("opencode:") {
+                    opencodeCwdsFinal.insert(String(key.dropFirst(9)))
                 } else {
                     live.insert(key)
                 }
             }
-            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts)
+            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts, opencodeCwds: opencodeCwdsFinal)
             DispatchQueue.main.async {
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
@@ -1133,14 +1403,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let claudeBusy = result.contains { $0.kind == .claude && $0.anyBusy }
                 let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
                 let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
+                let opencodeLive = result.contains { $0.kind == .opencode && $0.anyLive }
+                let opencodeBusy = result.contains { $0.kind == .opencode && $0.anyBusy }
+                let hermesLive = result.contains { $0.kind == .hermes && $0.anyLive }
+                let hermesBusy = result.contains { $0.kind == .hermes && $0.anyBusy }
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
                     : (self.claudeWasLive ? .done : self.claudeState)
                 self.codexState = codexBusy ? .running
                     : codexLive ? .inactive
                     : (self.codexWasLive ? .done : self.codexState)
+                self.opencodeState = opencodeBusy ? .running
+                    : opencodeLive ? .inactive
+                    : (self.opencodeWasLive ? .done : self.opencodeState)
+                self.hermesState = hermesBusy ? .running
+                    : hermesLive ? .inactive
+                    : (self.hermesWasLive ? .done : self.hermesState)
                 self.claudeWasLive = claudeLive
                 self.codexWasLive = codexLive
+                self.opencodeWasLive = opencodeLive
+                self.hermesWasLive = hermesLive
                 self.render()
             }
         }
@@ -1154,6 +1436,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func render() {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
+        indicatorView.opencodeState = opencodeState
+        indicatorView.hermesState = hermesState
         indicatorView.t = CGFloat(frame) * 0.12
     }
 }
@@ -1165,12 +1449,16 @@ if CommandLine.arguments.contains("--scan") {
     for s in snaps { print("\(s.kind.rawValue): path=\(s.transcriptPath ?? "nil") cwd=\(s.cwd ?? "nil")") }
     var live = Set<String>()
     var cwdCounts: [String: Int] = [:]
+    var opencodeCwds = Set<String>()
     for s in snaps {
         if let p = s.transcriptPath { live.insert(p) }
         else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
+        else if s.kind == .opencode, let c = s.cwd { opencodeCwds.insert(c) }
+        else if s.kind == .codex { live.insert("codex-desktop") }
+        else if s.kind == .hermes { live.insert("hermes") }
     }
     print("== sessions ==")
-    for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
+    for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts, opencodeCwds: opencodeCwds) {
         print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count)")
     }
     exit(0)
