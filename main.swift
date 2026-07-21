@@ -42,11 +42,12 @@ final class ProcessDiscovery {
     // rollout file open, so the path route always works there.
     struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
 
-    private static let psTimeout: TimeInterval = 0.5
-    private static let lsofTimeout: TimeInterval = 0.2
+    private static let psTimeout: TimeInterval = 2.0
+    private static let lsofTimeout: TimeInterval = 2.0
 
     func liveTranscripts() -> [Snapshot] {
         guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,command="], timeout: Self.psTimeout) else { return [] }
+        var candidates: [(pid: String, tty: String, kind: AgentKind)] = []
         var out: [Snapshot] = []
         var claimed = Set<String>()
         for line in psOut.split(whereSeparator: \.isNewline) {
@@ -65,8 +66,7 @@ final class ProcessDiscovery {
             else { continue }
             // Claude requires terminal; Codex/OpenCode/Hermes can be desktop apps without TTY
             if kind == .claude, !hasTTY { continue }
-            // Codex desktop (no TTY): sentinel without lsof — desktop app has too many
-            // open files for lsof to be reliable at 0.2 s timeout
+            // Codex desktop (no TTY): sentinel without lsof
             if kind == .codex, !hasTTY {
                 guard claimed.insert("codex-desktop").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
@@ -78,16 +78,19 @@ final class ProcessDiscovery {
                 out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
                 continue
             }
-            guard let lsof = run("/usr/sbin/lsof", ["-a", "-p", pid, "-Fn"], timeout: Self.lsofTimeout) else { continue }
+            candidates.append((pid, tty, kind))
+        }
+        // Batch lsof for all remaining candidates
+        let chunks = lsofChunks(pids: candidates.map(\.pid))
+        for (pid, tty, kind) in candidates {
+            guard let lsof = chunks[pid] else { continue }
             let cwd = workingDirectory(from: lsof)
-            // Claude subagents run in .claude/worktrees/agent-*/ — they are
-            // metadata on the parent session, not sessions of their own.
+            // Claude subagents run in .claude/worktrees/agent-*/
             if kind == .claude, let cwd, cwd.contains("/.claude/worktrees/agent-") { continue }
             switch kind {
             case .claude:
                 let path = bestClaudeTranscript(in: lsof, cwd: cwd)
                 guard path != nil || cwd != nil else { continue }
-                // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             case .codex:
@@ -100,15 +103,34 @@ final class ProcessDiscovery {
                     out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: nil))
                 }
             case .opencode:
-                // OpenCode uses SQLite — cwd-based fallback, like Claude
                 guard cwd != nil else { continue }
                 guard claimed.insert("opencode:\(tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: nil, cwd: cwd))
             case .hermes:
-                break // unreachable: hermes handled before lsof guard
+                break // unreachable: hermes handled before lsof
             }
         }
         return out
+    }
+
+    /// One lsof for all pids; -Fn output is split per-pid on its `p<pid>` markers.
+    private func lsofChunks(pids: [String]) -> [String: String] {
+        guard !pids.isEmpty,
+              let outText = run("/usr/sbin/lsof", ["-a", "-p", pids.joined(separator: ","), "-Fn"], timeout: Self.lsofTimeout) else { return [:] }
+        var chunks: [String: String] = [:]
+        var curPid: String?
+        var cur = ""
+        for line in outText.split(whereSeparator: \.isNewline) {
+            if line.first == "p" {
+                if let p = curPid { chunks[p] = cur }
+                curPid = String(line.dropFirst())
+                cur = ""
+            } else {
+                cur += line + "\n"
+            }
+        }
+        if let p = curPid { chunks[p] = cur }
+        return chunks
     }
 
     private func isClaude(_ command: String) -> Bool {
